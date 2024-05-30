@@ -1,0 +1,697 @@
+#!/bin/bash
+
+PYTHON_VERSION=3.12
+PYTHON=python$PYTHON_VERSION
+# CHECK PYTHON 3
+if command -v $PYTHON &>/dev/null; then
+    echo Python3 available
+else
+    echo Python3 not available, please install it or add to the PATH variable
+    exit 1
+fi
+
+# CHECK PIP
+if command -v $PYTHON -m pip &>/dev/null; then
+    echo Pip available
+else
+    echo Pip not available, please install it or add to the PATH variable
+    exit 1
+fi
+
+# CHECK VIRTUALENV COMMAND
+if command -v $PYTHON -m venv &>/dev/null; then
+    echo Venv command available
+else
+    echo Venv not available, please install it [For example: python3 -m pip install python-venv]
+    exit 1
+fi
+
+COMMAND=$1
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+    --python-version)
+        PYTHON_VERSION="$2"
+        shift
+        shift
+        ;;
+    *)
+        COMMAND=$1
+        shift
+        break
+        ;;
+    esac
+    shift
+done
+# CHECK VENV NOT EXISTS
+if [ ! -d .venv ]; then
+
+    $PYTHON -m venv .venv
+    if [ ! -d .pip ]; then
+        mkdir .pip
+        curl https://bootstrap.pypa.io/get-pip.py -o .pip/get-pip.py
+    fi
+    .venv/bin/python3 .pip/get-pip.py
+    .venv/bin/pip3 install -r requirements.txt
+    .venv/bin/pip3 install -r requirements-for-tests.txt
+fi
+
+if [ -f '.env' ]; then
+    echo Use .env file to read sensitive information
+    while IPS='=' read -r key _; do
+        eval "export ${key}"
+    done <'.env'
+else
+    # REGENERATE SENSITIVE INFO FROM TEMPLATE
+    cat >'.env' <<EOF
+# PYTHONPATH=
+DOCKER_TAG_SUFFIX=dev
+PUBLIC_FRONT_URL=http://localhost:8012
+
+HTTP_PORT=8012
+SERVER_PORT=8312
+SERVER_SSL_PROTO=ssl
+HOST_HOSTNAME=localhost
+PUBLIC_DOMAIN= 
+
+# Debug mode
+DEBUG=True
+
+DATABASE_TEST12_HOST=pg
+DATABASE_TEST12_NAME=test12
+DATABASE_TEST12_USER=test12
+DATABASE_TEST12_PASSWORD=test12
+
+EOF
+fi
+
+echo EXECUTE
+echo "=========== $COMMAND"
+echo "$COMMAND ==========="
+echo COMMAND
+
+SERVICES_CORE=('pg')
+SERVICES=('pg' 'service')
+
+#========================================== BASIC TOOLS ===========================================
+
+if [ "$COMMAND" == "redeps" ]; then
+    echo "Reinstall dependencies"
+    .venv/bin/pip3 install -r requirements.txt
+    .venv/bin/pip3 install -r requirements-for-tests.txt
+fi
+
+if [ "$COMMAND" == "clean" ]; then
+    echo "Clean temporary folders"
+    find . -name __pycache__ -print0 | xargs -0 rm -fr
+fi
+
+
+#                                    #
+# DOCKER INFRASTRACTURE AND COMMANDS #
+#                                    #
+
+function docker_build {
+    echo "Build docker image $1 from $2"
+    mkdir -p .prebuild
+    docker build -t "$1" -f "$2" "$3" || exit 1
+    rm -fr .prebuild
+}
+
+function build {
+    # # Build the backend
+    # SERVICE=tms
+    # SERVICE_IMAGE_NAME=local/$SERVICE:v1${DOCKER_TAG_SUFFIX}
+    # docker_build "$SERVICE_IMAGE_NAME" 'Dockerfile' '.' || exit 1
+
+    SERVICE=tms
+    # Build the frontend
+    rm -fr .build-fronts-folder || {
+        echo "Can't remove the .build-fronts-folder"
+        exit "$ERRCODE"
+    }
+    mkdir -p .build-fronts-folder || {
+        echo "Can't make the .build-fronts-folder"
+        exit "$ERRCODE"
+    }
+    git clone --single-branch --branch dev "git@gitlab.dellin.ru:itm23/tms-front.git" .build-fronts-folder/dev
+    # There is the fix for access error
+    # sed -i 's/gitlab.dellin.ru\:5005\/web-bia\/docker-images\///g' .build-fronts-folder/dev/Dockerfile
+    # sed -i 's/gitlab.dellin.ru\:5005\/itm23\/docker-images\///g' .build-fronts-folder/dev/Dockerfile
+    # sed -i 's/\}-dev/\}/g' .build-fronts-folder/dev/Dockerfile
+
+    SERVICE_IMAGE_NAME=local/$SERVICE:front-dev
+    docker_build "$SERVICE_IMAGE_NAME" '.build-fronts-folder/dev/Dockerfile' '.build-fronts-folder/dev' PUBLIC_FRONT_URL="${PUBLIC_FRONT_URL}" APPLICATION_URL_CONTEXT="${APPLICATION_URL_CONTEXT}" || {
+        echo "The error occur when docker_build ${SERVICE_IMAGE_NAME}"
+        exit "$ERRCODE"
+    }
+}
+
+if [ "$COMMAND" == "build" ]; then
+    build
+fi
+
+function django_environment_variables {
+    DJANGO_SECRET_KEY=$(.venv/bin/python3 -c 'from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())')
+    export DJANGO_SECRET_KEY
+
+}
+#========================================== RUN TOOLS =============================================
+
+if [ "$COMMAND" == "manage" ]; then
+    echo Run manage script service/manage.py "$@"
+
+    django_environment_variables
+
+    .venv/bin/python3 service/manage.py "$@"
+fi
+
+if [ "$COMMAND" == "tests" ] || [ "$COMMAND" == "test" ]; then
+    echo Run manage script service/manage.py test service/unit_tests "$@"
+
+    django_environment_variables
+
+    .venv/bin/python3 service/manage.py test service/unit_tests "$@"
+fi
+
+if [ "$COMMAND" == "run" ]; then
+    echo Run manage script service/manage.py runserver "$@"
+
+    django_environment_variables
+
+    .venv/bin/python3 service/manage.py runserver "$@"
+fi
+
+if [ "$COMMAND" == "front" ]; then
+    echo Run npm run start "$@"
+    # Sample: ./buildew manage loaddata app_moods/fixtures/geometry_shapes.yaml
+    export BACKEND_API_ENDPOINT=http://localhost:8000
+
+    npm run start "$@"
+fi
+
+#========================================== DOCKER INFRASTRACTURE AND COMMANDS ====================
+
+function docker_build {
+    echo "Build docker image $1 from $2"
+    BUILD_FOLDER=$3
+    if [[ -n "$BUILD_FOLDER" ]]; then
+        echo "Build folder is ${BUILD_FOLDER}"
+    fi
+    BUILD_ARGS=("$4" "$5" "$6" "$7" "$8" "$9")
+    BUILD_ARGS_CONCAT=
+    if ((${#BUILD_ARGS[@]})); then
+        for BUILD_ARG in "${BUILD_ARGS[@]}"; do
+            if [[ -n "$BUILD_ARG" ]]; then
+                BUILD_ARGS_CONCAT="$BUILD_ARGS_CONCAT --build-arg $BUILD_ARG"
+            fi
+        done
+        echo "Build args are: ${BUILD_ARGS_CONCAT}"
+    fi
+    echo "================================================================================================================================="
+
+    mkdir -p .prebuild
+    docker build ${BUILD_ARGS_CONCAT} -t "$1" -f "$2" "$BUILD_FOLDER" || {
+        echo "Can't docker_build $1 $2 $BUILD_FOLDER"
+        exit $ERRCODE
+    }
+    rm -fr .prebuild
+}
+
+function check_folder {
+    FOLDER=$1
+    mkdir -p "$FOLDER" || exit 1
+    chmod a+rwx "$FOLDER"
+    for SERVICE in "${SERVICES[@]}"; do
+        mkdir -p "$FOLDER/$SERVICE" || exit 1
+        chmod a+rwx "$FOLDER/$SERVICE"
+    done
+}
+
+function check_history_folder {
+    FOLDER=.history
+    mkdir -p $FOLDER || exit 1
+    chmod a+rwx $FOLDER
+    for SERVICE in "${SERVICES[@]}"; do
+        mkdir -p "$FOLDER/$SERVICE" || exit 1
+        chmod a+rwx "$FOLDER/$SERVICE"
+        touch "$FOLDER/$SERVICE/.bash_history"
+        chmod a+rwx "$FOLDER/$SERVICE/.bash_history"
+    done
+}
+
+function setup_folders {
+    check_folder .data
+    # Tune images folder
+    #mkdir -p .data/front/images || exit 1
+    #chmod a+rwx .data/front/images
+
+    # Tune certbot folder
+    touch .data/certbot/regru.ini
+    mkdir .data/certbot/wwww
+    mkdir .data/certbot/conf
+
+    # Sync Images, TODO: put on s3 storage
+    # cp back/app/static/images/photo_2021-11-10_11-15-00.jpg .data/front/images/cover
+
+    # Check the temporary folders
+    check_folder .tmp
+
+    # Check the logger folders
+    check_folder .logs
+    # Tune front folders
+    mkdir -p .logs/front/nginx || exit 1
+    chmod a+rwx .logs/front/nginx
+
+    # Check the home folders
+    check_history_folder
+}
+
+function local_cert {
+    CERT_FOLDER=.data/certbot/conf/live/${HOST_HOSTNAME}${PUBLIC_DOMAIN}
+    if [ ! -f "$CERT_FOLDER/privkey.pem" ]; then
+        mkdir -p "$CERT_FOLDER"
+        openssl genrsa >"$CERT_FOLDER/privkey.pem"
+        openssl req -new -x509 -key "$CERT_FOLDER/privkey.pem" >"$CERT_FOLDER/fullchain.pem"
+    fi
+}
+
+function refresh {
+    SERVICE=service
+    SERVICE_IMAGE_NAME=usalko/diaplex.org:${SERVICE}-v1-${DOCKER_TAG_SUFFIX}
+
+    docker compose up --wait pg
+    # Remove container if it is running
+
+    DOCKER_COMPOSE_NETWORK=${PWD##*/}_default
+    echo "Docker compose network is $DOCKER_COMPOSE_NETWORK"
+
+    # TODO:
+    # docker run \
+    #     --network="${DOCKER_COMPOSE_NETWORK}" \
+    #     --env DJANGO_PRODUCTION=True \
+    #     --env DJANGO_SECRET_KEY="${DJANGO_SECRET_KEY}" \
+    #     --mount type=bind,source="${PWD}"/.logs/service,destination=/var/log \
+    #     --mount type=bind,source="${PWD}"/.tmp/service,destination=/tmp \
+    #     --mount type=bind,source="${PWD}"/service/media,destination=/media \
+    #     "${SERVICE_IMAGE_NAME}" python3 manage.py migrate
+
+    # https://entgo.io/docs/versioned-migrations/
+
+    atlas migrate apply \
+        --dir "file://ent/migrate/migrations" \
+        --url "postgres://diaplex:diaplex@pg:5432/diaplex?search_path=public&sslmode=disable"
+
+    # mkdir -p .data/front/diaplex/static || exit 1
+    # mkdir -p .data/front/webpage/static || exit 1
+    # mkdir -p .data/front/static || exit 1
+    # cp -R service/diaplex/static/* .data/front/diaplex/static
+    # cp -R service/webpage/static/* .data/front/webpage/static
+
+    # Remove container if it is running
+    docker rm ${SERVICE}-temp
+
+    # docker run \
+    #     --env DJANGO_PRODUCTION=True \
+    #     --mount type=bind,source="${PWD}"/.data/front/static,destination=/static \
+    #     --mount type=bind,source="${PWD}"/service/media,destination=/media \
+    #     --mount type=bind,source="${PWD}"/.data/front/diaplex/static,destination=/diaplex/static \
+    #     --name ${SERVICE}-temp "${SERVICE_IMAGE_NAME}" python3 manage.py collectstatic --noinput
+
+    docker container stop ${SERVICE}-temp
+
+    # Replace the original image with the result:
+    # (reverting CMD to whatever it was, otherwise it will be set to /some/post-configure/command)
+    # docker commit --change="CMD bash" ${SERVICE}-temp ${SERVICE_IMAGE_NAME}
+
+    # Delete the temporary container:
+    docker rm ${SERVICE}-temp
+}
+
+function build {
+    setup_folders
+    local_cert
+
+    # # Dependencies
+    # rm -fr .build-dependencies-folder || { echo "Can't remove the .build-dependencies-folder"; exit $ERRCODE; }
+    # mkdir -p .build-dependencies-folder || { echo "Can't make the .build-dependencies-folder"; exit $ERRCODE; }
+    # BRANCH_NAME=logical-operators-dev
+    # git clone --single-branch --branch "$BRANCH_NAME" "https://github.com/usalko/strawberry-django-plus.git" ".build-dependencies-folder/$BRANCH_NAME"
+    # # The end of dependencies section
+
+    SERVICE=service
+    SERVICE_IMAGE_NAME=usalko/diaplex.org:${SERVICE}-v1-${DOCKER_TAG_SUFFIX}
+    docker_build "$SERVICE_IMAGE_NAME" 'service/Dockerfile' 'service' || {
+        echo "Error when build docker image: usalko/diaplex.org:${SERVICE}-v1-${DOCKER_TAG_SUFFIX}"
+        exit 1
+    }
+
+    # Build the frontend
+    SERVICE_IMAGE_NAME=usalko/diaplex.org:${SERVICE}-front-${DOCKER_TAG_SUFFIX}
+    docker_build "$SERVICE_IMAGE_NAME" 'Dockerfile' '.' PUBLIC_FRONT_URL="${PUBLIC_FRONT_URL}" APPLICATION_URL_CONTEXT="${APPLICATION_URL_CONTEXT}" YANDEX_METRIC_ID="${YANDEX_METRIC_ID}" || {
+        echo "The error occur when docker_build ${SERVICE_IMAGE_NAME}"
+        exit "$ERRCODE"
+    }
+
+    # Build the certbot
+    SERVICE_IMAGE_NAME=usalko/diaplex.org:${SERVICE}-certbot
+    docker_build "$SERVICE_IMAGE_NAME" 'Dockerfile.certbot' '.' || {
+        echo "The error occur when docker_build ${SERVICE_IMAGE_NAME}"
+        exit "$ERRCODE"
+    }
+}
+
+if [ "$COMMAND" == "build" ]; then
+    # Start docker _build
+    build
+fi
+
+function start {
+
+    setup_folders
+
+    if [ "$1" == "" ]; then
+        docker-compose up
+    else
+        # Parse arguments to detect service group "core"
+        DOCKER_COMPOSE_ARGUMENTS=
+        for ARG in "$@"; do
+            if [ "$ARG" == "core" ]; then
+                DOCKER_COMPOSE_ARGUMENTS="$DOCKER_COMPOSE_ARGUMENTS ${SERVICES_CORE[*]}"
+            else
+                DOCKER_COMPOSE_ARGUMENTS="$DOCKER_COMPOSE_ARGUMENTS $ARG"
+            fi
+        done
+
+        docker-compose up $DOCKER_COMPOSE_ARGUMENTS
+    fi
+}
+
+if [ "$COMMAND" == "run" ] || [ "$COMMAND" == "up" ] || [ "$COMMAND" == "start" ]; then
+    echo 'Run docker images'
+
+    start "$@"
+
+fi
+
+function stop {
+    if [ "$1" == "" ]; then
+        docker-compose down -v --remove-orphans
+    else
+        docker-compose stop "$@"
+    fi
+}
+
+if [ "$COMMAND" == "refresh" ]; then
+    echo 'Refresh docker images'
+    refresh
+    stop "$@"
+    start "$@" &
+fi
+
+if [ "$COMMAND" == "upgrade-db" ]; then
+    echo 'Upgrade postgres database'
+    stop pg
+
+    DOCKER_COMPOSE_NETWORK=${PWD##*/}_default
+    echo "Docker compose network is $DOCKER_COMPOSE_NETWORK"
+    OLD_POSTGRES_IMAGE_NAME=postgres:14.7-alpine
+    NEW_POSTGRES_IMAGE_NAME=postgres:16.1-alpine
+
+    DATAOLD=.data/pg.old
+    DATANEW=.data/pg
+    # Move TO data for old directory
+    # if [ -d $DATAOLD ]; then
+    #     echo Sorry I can\'t continue old data folder presented $DATAOLD.
+    #     exit 1
+    # fi
+
+    # mv $DATANEW $DATAOLD
+    BINOLD=.data/pg.bin.old
+    mkdir -p $BINOLD
+    chmod a+rwx -R $BINOLD
+    mkdir -p $DATANEW
+    chmod a+rwx -R $DATANEW
+
+    docker run \
+        --network="${DOCKER_COMPOSE_NETWORK}" \
+        --env POSTGRES_DB=diaplex \
+        --env POSTGRES_USER=diaplex \
+        --env POSTGRES_PASSWORD=diaplex \
+        --mount type=bind,source="${PWD}"/$DATAOLD,destination=/var/lib/postgresql/data \
+        --mount type=bind,source="${PWD}"/$BINOLD,destination=/bin.old \
+        "${OLD_POSTGRES_IMAGE_NAME}" cp -R /usr/local /bin.old/
+
+    docker run \
+        --network="${DOCKER_COMPOSE_NETWORK}" \
+        --env POSTGRES_DB=diaplex \
+        --env POSTGRES_USER=diaplex \
+        --env POSTGRES_PASSWORD=diaplex \
+        --env PGBINOLD=/bin.old/bin \
+        --env PGDATANEW=/var/lib/postgresql/data \
+        --env PGDATAOLD=/var/lib/postgresql/data.old \
+        --mount type=bind,source="${PWD}"/$DATAOLD,destination=/var/lib/postgresql/data.old \
+        --mount type=bind,source="${PWD}"/$DATANEW,destination=/var/lib/postgresql/data \
+        --mount type=bind,source="${PWD}"/$BINOLD,destination=/bin.old \
+        --mount type=bind,source="${PWD}"/.tmp/pg,destination=/tmp \
+        "${NEW_POSTGRES_IMAGE_NAME}" su postgres -c 'cd /tmp && pg_upgrade'
+
+        # PGBINOLD
+        # PGDATAOLD
+        # PGDATANEW
+
+        # "${OLD_POSTGRES_IMAGE_NAME}" su postgres -c 'pg_dump -U diaplex >> /tmp/upgrade_backup_mydb.sql'
+
+    # pg_upgrade -b oldbindir [-B newbindir] -d oldconfigdir -D newconfigdir [option...]
+    # start pg &
+fi
+
+if [ "$COMMAND" == "stop" ] || [ "$COMMAND" == "down" ] || [ "$COMMAND" == "finish" ]; then
+    echo 'Stop docker images'
+
+    stop "$@"
+fi
+
+if [ "$COMMAND" == "restart" ]; then
+    echo 'Restart services or whole system'
+    stop "$@"
+    start "$@" &
+fi
+
+#========================================== PUBLISH TOOLS =========================================
+if [ "$COMMAND" == "publish" ]; then
+    echo 'Publish docker images usalko/diaplex.org:* to dockerhub'
+
+    build || {
+        echo "Line 262: Error in build... Exit..."
+        exit 1
+    }
+
+    SERVICE=service
+
+    IMAGE=usalko/diaplex.org:${SERVICE}-v1-${DOCKER_TAG_SUFFIX}
+    docker push "$IMAGE" || {
+        echo "Line 268: Error in push to dockerhub image $IMAGE ... Exit..."
+        exit 1
+    }
+
+    IMAGE=usalko/diaplex.org:${SERVICE}-front-${DOCKER_TAG_SUFFIX}
+    docker push "$IMAGE" || {
+        echo "Line 274: Error in push to dockerhub image $IMAGE... Exit..."
+        exit 1
+    }
+
+    IMAGE=usalko/diaplex.org:${SERVICE}-certbot
+    docker push "$IMAGE" || {
+        echo "Line 281: Error in push to dockerhub image $IMAGE... Exit..."
+        exit 1
+    }
+
+fi
+
+function remove_front_image {
+    FRONT_CONTAINER=$(docker image ls | grep front | awk 'NR==1{ print $3 }')
+    docker image rm "$FRONT_CONTAINER" --force
+}
+
+function remove_back_image {
+    V1_CONTAINER=$(docker image ls | grep v1 | awk 'NR==1{ print $3 }')
+    docker image rm "$V1_CONTAINER" --force
+}
+
+if [ "$COMMAND" == "renew" ]; then
+    echo 'Renew all'
+    # stop "$@" #TODO: uncomment after fix docker-compose.yaml
+    stop
+    remove_front_image
+    remove_back_image
+    # start "$@" & #TODO: uncomment after fix docker-compose.yaml
+    start core service front &
+fi
+
+if [ "$COMMAND" == "renew-back" ]; then
+    echo 'Renew back'
+    docker-compose stop service
+    remove_back_image
+    docker-compose up --no-start service
+    docker-compose start service &
+fi
+
+if [ "$COMMAND" == "renew-front" ]; then
+    echo 'Renew front'
+    docker-compose stop front
+    remove_front_image
+    docker-compose up --no-start front
+    docker-compose start front &
+fi
+
+#========================================== DUMP UTILS ============================================
+
+function create_tmp_file {
+    # Function set global variable TMP_FILE
+    FOLDER=$1
+    SUFFIX=$2
+    PREFIX=$3
+    TMP_FILE=$(mktemp -q "${FOLDER}/${PREFIX}XXXXXX${SUFFIX}")
+    if [ $? -ne 0 ]; then
+        echo "$0: Can't create temp file, bt template ${FOLDER}/${PREFIX}XXXXXX${SUFFIX}  ..."
+        exit 1
+    fi
+}
+
+function dump_database_to_json {
+    SERVICE=service
+    SERVICE_IMAGE_NAME=usalko/diaplex.org:${SERVICE}-v1-${DOCKER_TAG_SUFFIX}
+    docker_build "$SERVICE_IMAGE_NAME" 'Dockerfile' '.' || exit 1
+
+    docker-compose up --wait pg
+    # Remove container if it is running
+
+    DOCKER_COMPOSE_NETWORK=${PWD##*/}_default
+    echo Docker compose network is "$DOCKER_COMPOSE_NETWORK"
+
+    APPLICATIONS="service"
+    for app in $APPLICATIONS; do
+
+        create_tmp_file "/tmp" ".json" "dump-db.${app}."
+
+        docker run \
+            --network="${DOCKER_COMPOSE_NETWORK}" \
+            --env DJANGO_PRODUCTION=True \
+            --env DJANGO_SECRET_KEY="${DJANGO_SECRET_KEY}" \
+            --mount type=bind,source="${PWD}/.logs/${SERVICE},destination=/var/log" \
+            --mount type=bind,source="${PWD}/.tmp/${SERVICE},destination=/tmp" \
+            "${SERVICE_IMAGE_NAME}" python3 manage.py dumpdata "$app" >"${TMP_FILE}" || exit 1
+
+        # mv "${PWD}/.tmp/${SERVICE}${TMP_FILE}" "${TMP_FILE}"
+        gzip "${TMP_FILE}"
+
+        echo Database dump stored to the file: "${TMP_FILE}.gz"
+    done
+}
+
+if [ "$COMMAND" == "dump" ]; then
+    dump_database_to_json
+fi
+
+if [ "$COMMAND" == "save-db-structure-as-png" ]; then
+    if command dot -V &>/dev/null; then
+        echo dot command available
+    else
+        echo dot command not available, please install it [For example: sudo apt install graphviz]
+        exit 1
+    fi
+    .venv/bin/pip3 install pygraphviz
+    .venv/bin/pip3 install pyparsing pydot
+    .venv/bin/pip3 install django_extensions
+
+    TMP_FOLDER="$(mktemp -d /tmp/buildew.XXXXXXXXX)" || exit 1
+    TMP_PACKAGE="$(mktemp -d "${TMP_FOLDER}"/pXXXXXXXXX)" || exit 1
+    PACKAGE_NAME=$(basename "$TMP_PACKAGE")
+
+    cp service/*.py "$TMP_PACKAGE"
+    {
+        cat service/settings.py
+        echo ""
+        echo "# ADDITIONAL APPLICATION"
+        echo "if not ('django_extensions' in INSTALLED_APPS):"
+        echo "    INSTALLED_APPS.append('django_extensions')"
+    } >"$TMP_PACKAGE/tmp_settings.py"
+
+    PYTHONPATH=.:$TMP_FOLDER DJANGO_SETTINGS_MODULE=$PACKAGE_NAME.tmp_settings .venv/bin/python3 manage.py graph_models -a -g -o db.structure.png
+
+    rm -fr "$TMP_FOLDER"
+fi
+
+#========================================== SERVICE MODULE COMMANDS ===============================
+if [ "$COMMAND" == "tidy" ]; then
+    echo Run go mod tidy in service folder
+    CD=$PWD
+    cd service
+    go get github.com/usalko/s2d3
+    go mod tidy
+    cd $CD
+fi
+
+#========================================== LOGS ==================================================
+if [ "$COMMAND" == "log" ]; then
+    if [ "$*" == "" ]; then
+        echo 'Show logs tail <= 10000 entries'
+        docker-compose logs -f --tail 10000
+    else
+        echo "Show logs (docker compose logs -f $*)"
+        docker-compose logs -f "$@"
+    fi
+fi
+if [ "$COMMAND" == "logs" ]; then
+    if [ "$*" == "" ]; then
+        echo 'Show logs with timestamp tail <= 10000 entries'
+        docker-compose logs -f --tail 10000 --timestamps
+    else
+        echo "Show logs with timestamp (docker compose logs -f --timestamps $*)"
+        docker-compose logs -f --timestamps "$@"
+    fi
+fi
+
+# ================================= CERTBOT =======================================================
+if [ "$COMMAND" == "certbot-test-run" ]; then
+    [ -n "$1" ] || [ "$1" == "*" ] || {
+        echo "Please determine the host name for the domain $PUBLIC_DOMAIN, as an example for my-host.$PUBLIC_DOMAIN: ./buildew certbot-test-run my-host"
+        exit 63
+    }
+    if [ "$1" == "*" ]; then
+        echo "Test run (dry run) certbot for the host: *$PUBLIC_DOMAIN"
+        docker compose run --rm certbot certonly --webroot --webroot-path /var/www/certbot/ --dry-run -d "$PUBLIC_DOMAIN"
+    else
+        echo "Test run (dry run) certbot for the host: $1$PUBLIC_DOMAIN"
+        docker compose run --rm certbot certonly --webroot --webroot-path /var/www/certbot/ --dry-run -d "$1$PUBLIC_DOMAIN"
+    fi
+fi
+if [ "$COMMAND" == "certbot-run" ]; then
+    [ -n "$1" ] || [ "$1" == "*" ] || {
+        echo "Please determine the host name for the domain $PUBLIC_DOMAIN, as an example for my-host.$PUBLIC_DOMAIN: ./buildew certbot-run my-host"
+        exit 77
+    }
+    if [ "$1" == "*" ]; then
+        echo "Test run (dry run) certbot for the host: *$PUBLIC_DOMAIN"
+        docker compose run --rm certbot certonly --webroot --webroot-path /var/www/certbot/ -d "$PUBLIC_DOMAIN"
+    else
+        echo "Run certbot for the host: $1$PUBLIC_DOMAIN"
+        docker compose run --rm certbot certonly --webroot --webroot-path /var/www/certbot/ -d "$1$PUBLIC_DOMAIN"
+    fi
+fi
+if [ "$COMMAND" == "certbot-renew" ]; then
+    docker compose run --rm certbot renew
+fi
+
+# ======================================= GENERAL INFO ============================================
+if [ "$COMMAND" == "services" ]; then
+    echo There are available services:
+    for SERVICE in "${SERVICES[@]}"; do
+        echo ' - ' $SERVICE
+    done
+fi
+
+# =================================================================================================
+AVAILABLE_COMMANDS="run build up start stop down finish restart manage tests front redeps renew renew-front renew-back clean log logs publish certbot-test-run certbot-run certbot-renew dump upgrade-db save-db-structure-as-png tidy"
+echo ''
+[[ $AVAILABLE_COMMANDS =~ (^| )$COMMAND($| ) ]] && echo 'Ok' || echo 'Unknown command: ' "$COMMAND" && echo 'Available commands are: ' "$AVAILABLE_COMMANDS"

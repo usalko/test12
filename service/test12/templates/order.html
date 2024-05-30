@@ -1,0 +1,21 @@
+<html>
+    <body>
+        <form action="/order/" enctype="multipart/form-data" method="post">
+            {% csrf_token %}
+{% for field in form %}
+    <div class="fieldWrapper">
+        {{ field.errors }}
+        <label> 
+            {{ field.label_tag }}
+        </label>
+       <div>
+           {{ field }}
+       </div>
+    </div>
+{% endfor %}
+<div>
+    <input type="submit">
+</div>
+</form>
+</body>
+</html>

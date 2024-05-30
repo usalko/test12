@@ -1,0 +1,60 @@
+version: '3.7'
+
+# Settings and configurations that are common for all containers
+x-containers-common: &containers-common
+  logging:
+    driver: "json-file"
+    options:
+      # see promtail configuration: promtail-config.docker-logs.yaml
+      tag: "{{.ImageName}}|{{.Name}}|{{.ImageFullID}}|{{.FullID}}"
+
+services:
+
+  pg:
+    <<: *containers-common
+    image: postgres:15.6-alpine
+    restart: on-failure
+    mem_limit: 512M
+    environment:
+      POSTGRES_PASSWORD: test12
+      POSTGRES_USER: test12
+      POSTGRES_DB: test12
+    # Expose as 127.0.0.1:5432 on host machine for the developers
+    ports:
+      - '5432:5432'
+    volumes:
+      - .data/pg15:/var/lib/postgresql/data
+      - .logs/pg15:/var/logs
+      - .tmp/pg15:/tmp
+      - type: bind
+        source: .history/pg/.bash_history
+        target: /root/.bash_history
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U test12" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  service:
+    <<: *containers-common
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+      # extra_hosts:
+      #   nexus.bia-tech.ru: 10.210.90.10
+    volumes:
+      - '.:/home/web/app'
+      - type: bind
+        source: .history/test12/.bash_history
+        target: /home/web/.bash_history
+    ports:
+      - 8012:8000
+    env_file:
+      - .env
+    links:
+      - pg
+    depends_on:
+      - pg
+    entrypoint: ./bin/dockerize -wait tcp://pg:5432 -timeout 60s
+    command: ./bin/start-gunicorn.sh
+
